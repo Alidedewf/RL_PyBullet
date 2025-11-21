@@ -4,53 +4,21 @@ import config
 
 class Task:
     def __init__(self, client_id):
-        self.client_id = client_id
-        
-        # Визуал (Красный шар)
-        target_visual_shape = p.createVisualShape(
-            shapeType=p.GEOM_SPHERE,
-            radius=0.2, # Чуть побольше, чтобы заметнее
-            rgbaColor=[1, 0, 0, 1]
-        )
-        
-        # Физика (Коллизия)
-        target_col_shape = p.createCollisionShape(
-            shapeType=p.GEOM_SPHERE,
-            radius=0.2
-        )
-        
-        # Создаем тело. Теперь оно ТВЕРДОЕ (есть CollisionShape).
-        self.target_id = p.createMultiBody(
-            baseMass=100, # Тяжелый шар, чтобы робот его не упинал в космос
-            baseVisualShapeIndex=target_visual_shape,
-            baseCollisionShapeIndex=target_col_shape, # <-- ВКЛЮЧИЛИ КОЛЛИЗИЮ
-            basePosition=[0, 0, 0],
-            physicsClientId=self.client_id
-        )
-        
-        self.target_pos_2d = np.array([0, 0])
+        self.cid = client_id
+        # Создаем "Призрачную" цель (без коллизии для физики, но видимую)
+        vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.2, rgbaColor=[1,0,0,1], physicsClientId=self.cid)
+        # Отключаем коллизию (-1), чтобы робот мог проехать сквозь центр
+        self.tid = p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis, baseCollisionShapeIndex=-1, basePosition=[0,0,0], physicsClientId=self.cid)
+        self.target_pos = np.array([0,0])
 
     def reset(self):
-        radius = np.random.uniform(1.0, config.MAX_TARGET_SPAWN_RADIUS)
-        angle = np.random.uniform(-np.pi, np.pi)
-        
-        target_x = radius * np.cos(angle)
-        target_y = radius * np.sin(angle)
-        
-        self.target_pos_2d = np.array([target_x, target_y])
-        
-        p.resetBasePositionAndOrientation(
-            self.target_id, 
-            [target_x, target_y, 0.2], 
-            [0, 0, 0, 1],
-            physicsClientId=self.client_id
-        )
-        
-        return self.target_pos_2d
+        r = np.random.uniform(1.0, config.MAX_TARGET_SPAWN_RADIUS)
+        a = np.random.uniform(-np.pi, np.pi)
+        self.target_pos = np.array([r * np.cos(a), r * np.sin(a)])
+        p.resetBasePositionAndOrientation(self.tid, [self.target_pos[0], self.target_pos[1], 0.2], [0,0,0,1], physicsClientId=self.cid)
+        return self.target_pos
 
-    def get_target_position(self):
-        return self.target_pos_2d
-        
-    def check_goal_reached(self, robot_pos_2d):
-        distance = np.linalg.norm(robot_pos_2d - self.target_pos_2d)
-        return distance < config.DISTANCE_THRESHOLD
+    def get_target_position(self): return self.target_pos
+    
+    def check_goal_reached(self, robot_pos):
+        return np.linalg.norm(robot_pos - self.target_pos) < config.DISTANCE_THRESHOLD
