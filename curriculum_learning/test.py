@@ -9,8 +9,8 @@ import numpy as np
 import time
 
 # --- Конфигурация ---
-LOG_DIR = "./logs/student_ppo_curriculum"
-MODEL_PATH = os.path.join(LOG_DIR, "final_student_model.zip")
+LOG_DIR = "./logs/student_ppo_curriculum_resumed"
+MODEL_PATH = os.path.join(LOG_DIR, "final_student_model_resumed.zip")
 FRAME_STACKS = 4
 N_EVAL_EPISODES = 50
 TOP_K = 10

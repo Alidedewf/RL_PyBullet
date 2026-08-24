@@ -3,79 +3,79 @@ from gymnasium import spaces
 import pybullet as p
 import pybullet_data
 import numpy as np
-import time
 from collections import deque
-import cv2 # Для Grayscale и Resizing
+import cv2
+import time
 
 class RobotArmEnv(gym.Env):
-    def __init__(self, render_mode='rgb_array', image_size=64, frame_skip=8):
-        super(RobotArmEnv, self).__init__()
-        
-        # --- Параметры Среды ---
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
+
+    def __init__(self, render_mode='rgb_array', image_size=64, frame_skip=4, frame_stacks=4, max_steps=200):
+        super().__init__()
+        self.render_mode = render_mode
         self.image_size = image_size
         self.frame_skip = frame_skip
-        self.max_steps = 200 # Максимальное количество шагов в эпизоде
-        self.current_step = 0
-        
-        # --- PyBullet Setup ---
+        self.frame_stacks = frame_stacks
+        self.max_steps = max_steps
+
+        # PyBullet
         self.physicsClient = p.connect(p.GUI if render_mode == 'human' else p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.81, physicsClientId=self.physicsClient)
-        
-        # --- Загрузка Объектов ---
+
+        # load plane and robot
         self.planeId = p.loadURDF("plane.urdf", physicsClientId=self.physicsClient)
-        # Загрузка робота Panda
         self.robotId = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True, physicsClientId=self.physicsClient)
-        # Получение индекса концевого эффектора (gripper)
         self.end_effector_index = 11
-        
-        # Загрузка целевого объекта (маленький куб)
-        self.target_object_id = p.loadURDF("cube.urdf", globalScaling=0.08, physicsClientId=self.physicsClient) 
-        
-        # Установка начальных положений джоинтов (для стабильности)
+
+        # small cube target
+        self.target_object_id = p.loadURDF("cube.urdf", globalScaling=0.08, physicsClientId=self.physicsClient)
+
+        # initial joints
         self.initial_joint_positions = [0.0, 0.0, 0.0, -1.5, 0.0, 1.5, 0.0]
         for i in range(7):
             p.resetJointState(self.robotId, i, self.initial_joint_positions[i], physicsClientId=self.physicsClient)
 
-        # --- Пространство Наблюдений (Observation Space) ---
-        # 1. Пиксели: Grayscale 64x64x1 (C=1)
-        pixel_shape = (image_size, image_size, 1)
-        # 2. Проприоцепция: 7 углов джоинтов Panda
-        proprio_shape = (7,) 
-        
-        self.observation_space = spaces.Dict({
-            "pixels": spaces.Box(low=0, high=255, shape=pixel_shape, dtype=np.uint8),
-            "proprioception": spaces.Box(low=-np.pi, high=np.pi, shape=proprio_shape, dtype=np.float32)
-        })
-        
-        # --- Пространство Действий (Action Space) ---
-        # Delta X, Delta Y, Delta Z для концевого эффектора
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
-        
-        # --- Настройка Камеры (Eye-to-hand: над столом) ---
+        # camera
         self.viewMatrix = p.computeViewMatrixFromYawPitchRoll(
-            cameraTargetPosition=[0.5, 0, 0.2], # Центр стола
-            distance=0.7, 
-            yaw=90, 
-            pitch=-45, 
-            roll=0, 
+            cameraTargetPosition=[0.5, 0, 0.2],
+            distance=0.7,
+            yaw=90,
+            pitch=-45,
+            roll=0,
             upAxisIndex=2,
             physicsClientId=self.physicsClient
         )
         self.projMatrix = p.computeProjectionMatrixFOV(
-            fov=60, 
-            aspect=1.0, 
-            nearVal=0.1, 
+            fov=60,
+            aspect=1.0,
+            nearVal=0.1,
             farVal=10.0,
             physicsClientId=self.physicsClient
         )
 
-    # --- Вспомогательные Функции ---
+        # observation_space: pixels channels_first (C, H, W) and proprioception (7,)
+        pixel_shape = (self.frame_stacks, self.image_size, self.image_size)
+        self.observation_space = spaces.Dict({
+            "pixels": spaces.Box(low=0.0, high=1.0, shape=pixel_shape, dtype=np.float32),
+            "proprioception": spaces.Box(low=-np.pi, high=np.pi, shape=(7,), dtype=np.float32)
+        })
 
-    def _get_observation(self):
-        # 1. Получение изображения
-        # Используем TinyRenderer всегда, так как он быстрее для маленьких изображений на CPU и не тормозит основной поток
-        
+        # action: delta x,y,z in [-1,1] -> scaled inside env
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+
+        # internal
+        self._frame_buffer = deque(maxlen=self.frame_stacks)
+        self.current_step = 0
+        self.last_distance = None
+        self.next_seed = None
+
+        # dynamics tuning
+        self.max_delta = 0.03  # meters per action (scaled)
+        self.max_distance_norm = 1.0  # used to normalize distance
+
+    # ---------- Helpers ----------
+    def _render_frame(self):
         img_arr = p.getCameraImage(
             width=self.image_size,
             height=self.image_size,
@@ -84,42 +84,39 @@ class RobotArmEnv(gym.Env):
             renderer=p.ER_TINY_RENDERER,
             physicsClientId=self.physicsClient
         )
-        
         if img_arr is None or img_arr[2] is None:
-             # Fallback if rendering fails
-             gray_img = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
+            gray = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
         else:
-            rgb_img = np.reshape(img_arr[2], (self.image_size, self.image_size, 4))[:, :, :3]
-            # Преобразование в Grayscale (оптимизация)
-            gray_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
-            
-        pixels = np.expand_dims(gray_img, axis=-1) # Добавляем канал C=1
+            rgb = np.reshape(img_arr[2], (self.image_size, self.image_size, 4))[:, :, :3]
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        # normalize to [0,1]
+        frame = gray.astype(np.float32) / 255.0
+        return frame  # shape (H, W)
 
-        # 2. Получение проприоцепции (углы первых 7 джоинтов Panda)
-        joint_states = p.getJointStates(self.robotId, range(7), physicsClientId=self.physicsClient)
-        joint_positions = np.array([state[0] for state in joint_states], dtype=np.float32)
+    def _get_proprio(self):
+        joint_states = p.getJointStates(self.robotId, list(range(7)), physicsClientId=self.physicsClient)
+        joint_positions = np.array([s[0] for s in joint_states], dtype=np.float32)
+        return joint_positions
 
-        return {
-            "pixels": pixels,
-            "proprioception": joint_positions
-        }
+    def _get_observation(self):
+        # frame buffer -> channels_first
+        stacked = np.stack(list(self._frame_buffer), axis=0)  # (C, H, W)
+        proprio = self._get_proprio()
+        return {"pixels": stacked.astype(np.float32), "proprioception": proprio.astype(np.float32)}
 
     def _apply_action(self, action):
-        # Преобразование относительного действия [-1, 1] в абсолютное смещение (например, +/- 1 см)
-        max_delta = 0.01 
-        delta_pos = action * max_delta
-        
-        # Получение текущей позиции схвата
+        # action: [-1,1]^3 -> delta in meters
+        delta = np.clip(action, -1.0, 1.0) * self.max_delta
         link_state = p.getLinkState(self.robotId, self.end_effector_index, physicsClientId=self.physicsClient)
         current_pos = np.array(link_state[0])
-        
-        # Вычисление целевой позиции
-        target_pos = current_pos + delta_pos
-        
-        # Использование инверсной кинематики (IK) для вычисления углов джоинтов
-        # Оставляем ориентацию схвата фиксированной для простоты (например, направленной вниз)
-        orientation = p.getQuaternionFromEuler([0, -np.pi, 0]) 
-        
+        target_pos = current_pos + delta
+
+        # keep Z >= 0.0 (table) and limit workspace
+        target_pos[2] = max(0.02, target_pos[2])
+        target_pos[0] = float(np.clip(target_pos[0], 0.2, 0.8))
+        target_pos[1] = float(np.clip(target_pos[1], -0.4, 0.4))
+
+        orientation = p.getQuaternionFromEuler([0, -np.pi, 0])
         target_joints = p.calculateInverseKinematics(
             self.robotId,
             self.end_effector_index,
@@ -128,102 +125,120 @@ class RobotArmEnv(gym.Env):
             maxNumIterations=100,
             physicsClientId=self.physicsClient
         )
-        
-        # Применение углов джоинтов
         for i in range(7):
             p.setJointMotorControl2(
                 bodyUniqueId=self.robotId,
                 jointIndex=i,
                 controlMode=p.POSITION_CONTROL,
                 targetPosition=target_joints[i],
-                force=500, # Сила для перемещения
+                force=500,
                 physicsClientId=self.physicsClient
             )
 
+    # ---------- Gym API ----------
     def step(self, action):
-        # --- 1. Применение Действия и Frame Skipping (Требование 3) ---
-        self._apply_action(action)
-        
+        # apply and simulate
+        self._apply_action(np.asarray(action, dtype=np.float32))
         for _ in range(self.frame_skip):
             p.stepSimulation(physicsClientId=self.physicsClient)
-        
-        # --- 2. Получение Информации ---
-        obs = self._get_observation()
+
+        # update frames
+        frame = self._render_frame()
+        self._frame_buffer.append(frame)
+
+        # increment
         self.current_step += 1
-        
-        # --- 3. Расчет Награды (Reward Function) ---
+
+        # compute reward
         link_state = p.getLinkState(self.robotId, self.end_effector_index, physicsClientId=self.physicsClient)
         tool_pos = np.array(link_state[0])
-        
         obj_pos, _ = p.getBasePositionAndOrientation(self.target_object_id, physicsClientId=self.physicsClient)
         obj_pos = np.array(obj_pos)
-        
-        # Расстояние до цели
-        distance = np.linalg.norm(tool_pos - obj_pos)
-        
-        # Контакт (Sparse Reward) - проверяем контакт между схватом и объектом
+        distance = float(np.linalg.norm(tool_pos - obj_pos))
+        # contact
         contact_points = p.getContactPoints(self.robotId, self.target_object_id, self.end_effector_index, physicsClientId=self.physicsClient)
         is_contact = len(contact_points) > 0
-        
-        if is_contact:
-            print("CONTACT! +100")
-        
-        # Веса награды (Требование 5)
-        # Уменьшили штраф за расстояние (w1: 10.0 -> 1.0), чтобы общий итог при успехе был положительным
-        w1, w2, w3 = 1.0, 100.0, 0.01
-        
-        reward = - w1 * distance + w2 * is_contact - w3
-        
-        # --- 4. Проверка Завершения Эпизода ---
-        terminated = is_contact or self.current_step >= self.max_steps
-        truncated = False # В gymnasium 0.29+
-        info = {"distance": distance}
-        
+
+        # smooth normalized distance reward (closer -> higher)
+        dist_norm = np.clip(distance / self.max_distance_norm, 0.0, 1.0)
+        dist_reward = 1.0 - dist_norm  # in [0,1]
+
+        # delta shaping
+        if self.last_distance is None:
+            delta = 0.0
+        else:
+            delta = self.last_distance - distance  # positive if got closer
+        self.last_distance = distance
+
+        # contact bonus moderate
+        contact_reward = 5.0 if is_contact else 0.0
+
+        # small step penalty to encourage efficiency
+        step_penalty = -0.01
+
+        reward = float(dist_reward + 2.0 * delta + contact_reward + step_penalty)
+        # clip to avoid huge spikes
+        reward = float(np.clip(reward, -10.0, 10.0))
+
+        # termination
+        terminated = bool(is_contact or self.current_step >= self.max_steps)
+        truncated = False
+        info = {"distance": distance, "is_contact": is_contact}
+
+        obs = self._get_observation()
         return obs, reward, terminated, truncated, info
 
     def reset(self, seed=None, options=None):
+        # seed handling
         if hasattr(self, 'next_seed') and self.next_seed is not None:
             seed = self.next_seed
             self.next_seed = None
-            
+
+        # gymnasium seed
         super().reset(seed=seed)
-        
-        self.current_step = 0
-        
-        # Сброс робота в начальное положение
+        # use self.np_random for sampling
+        # reset simulation
+        p.resetSimulation(physicsClientId=self.physicsClient)
+        p.setGravity(0, 0, -9.81, physicsClientId=self.physicsClient)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        self.planeId = p.loadURDF("plane.urdf", physicsClientId=self.physicsClient)
+        self.robotId = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True, physicsClientId=self.physicsClient)
+        self.target_object_id = p.loadURDF("cube.urdf", globalScaling=0.08, physicsClientId=self.physicsClient)
+
+        # reset joints
         for i in range(7):
             p.resetJointState(self.robotId, i, self.initial_joint_positions[i], physicsClientId=self.physicsClient)
-        
-        # Сброс целевого объекта в случайное место (в пределах рабочей зоны)
-        # Рабочая зона X: [0.3, 0.7], Y: [-0.3, 0.3], Z: [0.0]
-        rand_x = self.np_random.uniform(low=0.3, high=0.7)
-        rand_y = self.np_random.uniform(low=-0.3, high=0.3)
+
+        # sample target position within workspace using controlled RNG
+        rand_x = float(self.np_random.uniform(low=0.35, high=0.65))
+        rand_y = float(self.np_random.uniform(low=-0.25, high=0.25))
         p.resetBasePositionAndOrientation(self.target_object_id, [rand_x, rand_y, 0.02], [0, 0, 0, 1], physicsClientId=self.physicsClient)
 
-        # Сброс симулятора и получение первого наблюдения
-        for _ in range(100): # Даем симулятору стабилизироваться
+        # step some steps to stabilize
+        for _ in range(50):
             p.stepSimulation(physicsClientId=self.physicsClient)
-            
-        initial_obs = self._get_observation()
+
+        # initialize frame buffer
+        self._frame_buffer.clear()
+        base_frame = self._render_frame()
+        for _ in range(self.frame_stacks):
+            self._frame_buffer.append(base_frame)
+
+        self.current_step = 0
+        self.last_distance = None
+
+        obs = self._get_observation()
         info = {}
-        
-        return initial_obs, info
+        return obs, info
 
     def render(self):
-        # PyBullet GUI handles rendering automatically
+        # GUI handled by pybullet
         pass
 
     def set_seed(self, seed):
+        # called from your evaluate / replay harness
         self.next_seed = seed
 
     def close(self):
         if p.isConnected(physicsClientId=self.physicsClient):
             p.disconnect(physicsClientId=self.physicsClient)
-
-# Регистрация среды для удобства
-gym.envs.registration.register(
-    id='RobotArmVisual-v0',
-    entry_point='robot_env:RobotArmEnv',
-    max_episode_steps=200,
-    kwargs={'render_mode': 'rgb_array', 'image_size': 64, 'frame_skip': 8}
-)
